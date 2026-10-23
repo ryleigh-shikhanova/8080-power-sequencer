@@ -16,6 +16,11 @@
 ;-----------------------------------------------------------
 ;
 
+; leds
+.equ    FAULT_LED_PIN,   9
+.equ    GOOD_LED_PIN,    11
+
+
 ; 5v
 .equ    DETECT_5V_PIN,  0       ; Arduino A0 = ADC0 / PC0
 .equ    ENABLE_5V_PIN,  2       ; Arduino D2 = PD2
@@ -43,6 +48,47 @@
 .equ    DETECT_NEG5V_ADC,   2   ; Arduino A2 = ADC2 / PC2
 
 .equ    ADC_REF,        4.82
+
+;
+; The rails defined below will be used to store the number of bad voltage readings
+; 	if ALLOWED_BAD_READS occurs on any one rail, a fault state will be entered
+; 	Each rail will be cleared on every good read of that rail. 
+;	Note: in the future, more advanced fault detection should be implemented
+;       For instance: a GBBGGGBBGGBBBBGGBGB state should most definitely enter a FAULT state
+;       Potentially we could track faults per 100 reads? Research what is safest 
+;
+; if a ADC is read that is either 50% (min_ADC >> 1) or > 200% ((min_ADC >> 1) + ADC) of the min ADC 
+;	for that rail, then the fault state will be entered even if that rail has not reached 
+;	ALLOWED_BAD_READS
+;
+;       ;EDIT: this information is not accurate to the current implementation...correct this later
+;
+;	ex. for the 5v rail the min ADC is at 504. So the ADC that will trigger an immediate
+;		fault is found by - > (504 >> 1) + 504 = 252 + 504 = 756 ADC
+;		So an ADC < 252 || > 756 shuts down power
+;		While a range of [252, 756] will incr that rails bad read count
+;
+.equ	ALLOWED_BAD_READS,  5
+
+.section .bss
+
+NEG5V_BAD_COUNT:
+	.skip 1
+
+_5V_BAD_COUNT:
+	.skip 1
+
+_12V_BAD_COUNT:
+	.skip 1
+
+;
+; High 4 bits = [Error details | Low 4 bits = Affected Rail]
+; Can also be used to indicate more specific details later...
+;	-5V ERROR = 1 = 0x01
+;	 5V ERROR = 2 = 0x02
+;       12V ERROR = 3 = 0x03
+ERROR_STATE:
+	.skip 1
 
 .section .text
 
@@ -98,6 +144,19 @@ ADC_WAIT:
 
     ret
 
+INIT_COUNTERS:	
+    clr     r16
+
+    sts     NEG5V_BAD_COUNTER,	r16
+    sts     _12V_BAD_COUNTER,   r16
+    sts	    _5V_BAD_COUNTER,    r16
+    ret
+
+INIT_ERROR_STATE:
+    cls	    r16
+
+    sts     ERROR_STATE,   r16
+    ret`
 INIT_ADC_PINS:
     ; set as inputs
     cbi     DDRC,   DETECT_5V_PIN
@@ -125,8 +184,9 @@ INIT_OUTPUT_PINS:
 ; r21:r20 = min adc val
 ; r23:r22 = max adc val
 ; returns r24:
+;   2 = bad read, check if r28 has reached it's bound
 ;   1 = good
-;   0 = bad
+;   0 = Immediate shutdown
 ;Clobbers:
 ;   r16, r18-r24
 CHECK_VOLTAGE:
@@ -147,11 +207,35 @@ CHECK_VOLTAGE:
     ret
 
 VOLTAGE_BAD:
-    clr     r24
+    ; if voltage is bad, we need to decide whether it is a fault or if we incr the rails bad read counter
+
+    ; min adc / 2 = low bound to auto shutdown
+    lsr     r21
+    ror	    r20
+
+    ; min adc * 2 = high bound to auto shutdown
+    lsl     r23
+    rol     r22
+
+    ; val < min / 2?
+    cp      r18,	r20
+    cp      r19,        r21
+    brlo    TRIGGER_SHUTDOWN
+    
+    ; this max needs more consideration giving it can exceed 1023
+    ; val > min * 2?
+    cp      r22,	r18
+    cp	    r23,	r19
+    brlo    TRIGGER_SHUTDOWN
+    ldi     r24,	2	
+    ret
+
+TRIGGER_SHUTDOWN:
+    clr    r24
     ret
 
 ; Clobbers the following registers
-; r18, r19, r20, r21, r22, r23, r24
+; r16, r18, r19, r20, r21, r22, r23, r24
 CHECK_NEG5V:
     ldi     r20,    lo8(MIN_NEG5V_ADC)
     ldi     r21,    hi8(MIN_NEG5V_ADC) 
@@ -162,9 +246,25 @@ CHECK_NEG5V:
     ldi     r24,    DETECT_NEG5V_ADC
 
     rcall   CHECK_VOLTAGE
-    tst     r24
+
+    cpi     r24,    0
     breq    FAULT
 
+    cpi     r24,    1
+    breq    NEG5V_GOOD
+NEG5V_BAD:
+    lds     r16,    NEG5V_BAD_COUNT
+    inc     r16
+    sts     NEG5V_BAD_COUNT, r16
+
+    cpi     r16,   ALLOWED_BAD_READS
+    brsh    FAULT
+
+    ret
+NEG5V_GOOD:
+    clr     r16
+    sts     NEG5V_BAD_COUNT, r16
+    
     ret
 
 ; Clobbers the following registers
@@ -179,9 +279,25 @@ CHECK_5V:
     ldi     r24,    DETECT_5V_PIN
 
     rcall   CHECK_VOLTAGE
-    tst     r24
+    
+    cpi     r24,    0
     breq    FAULT
 
+    cpi     r24,    1
+    breq    _5V_GOOD
+_5V_BAD:
+    lds     r16,    _5V_BAD_COUNT
+    inc     r16
+    sts     _5V_BAD_COUNT, r16
+
+    cpi     r16,    ALLOWED_BAD_READS
+    brsh    FAULT
+
+    ret
+_5V_GOOD:
+    clr     r16
+    sts     _5V_BAD_COUNT, r16
+    
     ret
 
 ; Clobbers the following registers
@@ -196,24 +312,42 @@ CHECK_12V:
     ldi     r24,    DETECT_12V_PIN
 
     rcall   CHECK_VOLTAGE
-    tst     r24
+
+    cpi     r24,    0
     breq    FAULT
+
+    cpi     r24,     1
+    breq    _5V_GOOD
+_12V_BAD:
+    lds    r16,      _5V_BAD_COUNT
+    inc    r16
+    sts    _5V_BAD_COUNT, r16
+
+    cpi    r16,     ALLOWED_BAD_READS
+    brsh   FAULT
+
+    ret
+_12V_GOOD:
+    clr     r16
+    sts     _12_BAD_COUNT, r16
 
     ret
 
 ENABLE_5V:
     sbi     PORTD, ENABLE_5V_PIN
     rcall   DELAY_20MS
-    rcall    CHECK_5V
+    rcall   CHECK_5V
     ret
 
 ENABLE_12V:
     sbi     PORTD, ENABLE_12V_PIN
     rcall   DELAY_20MS
-    rcall    CHECK_12V
+    rcall   CHECK_12V
     ret
 
 SETUP:
+    rcall   INIT_COUNTERS
+    rcall   INIT_ERROR_STATE
     rcall   INIT_ADC_PINS
     rcall   INIT_OUTPUT_PINS
     rcall   CHECK_NEG5V
