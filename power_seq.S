@@ -27,8 +27,10 @@
 
 ; assumptions that divider is 10k / 10k
 ; avcc is 4.82v
+.equ    ABS_LOW_5V,     200
 .equ    MIN_5V_ADC,     504
 .equ    MAX_5V_ADC,     557
+.EQU    ABS_HIGH_5V,    800
 
 ; 12v
 .equ    DETECT_12V_PIN, 1       ; Arduino A1 = ADC1 / PC1
@@ -36,38 +38,22 @@
 
 ; assumptions of 20k / 10k divider
 ; avcc is 4.82v
+.equ    ABS_LOW_12V,    500
 .equ    MIN_12V_ADC,    807
 .equ    MAX_12V_ADC,    891
+.equ    ABS_HIGH_12V,   1000
 
 ; -5v
 ; assumptions that divider network is 47k/68k
 ; pos v = 5.01
 ; avcc os 4.82v
+.equ    ABS_LOW_NEG5V,   100
 .equ    MIN_NEG5V_ADC,   173
 .equ    MAX_NEG5V_ADC,   217
+.equ    ABS_HIGH_NEG5V,  300
+
 .equ    DETECT_NEG5V_ADC,   2   ; Arduino A2 = ADC2 / PC2
 
-.equ    ADC_REF,        4.82
-
-;
-; The rails defined below will be used to store the number of bad voltage readings
-; 	if ALLOWED_BAD_READS occurs on any one rail, a fault state will be entered
-; 	Each rail will be cleared on every good read of that rail. 
-;	Note: in the future, more advanced fault detection should be implemented
-;       For instance: a GBBGGGBBGGBBBBGGBGB state should most definitely enter a FAULT state
-;       Potentially we could track faults per 100 reads? Research what is safest 
-;
-; if a ADC is read that is either 50% (min_ADC >> 1) or > 200% ((min_ADC >> 1) + ADC) of the min ADC 
-;	for that rail, then the fault state will be entered even if that rail has not reached 
-;	ALLOWED_BAD_READS
-;
-;       ;EDIT: this information is not accurate to the current implementation...correct this later
-;
-;	ex. for the 5v rail the min ADC is at 504. So the ADC that will trigger an immediate
-;		fault is found by - > (504 >> 1) + 504 = 252 + 504 = 756 ADC
-;		So an ADC < 252 || > 756 shuts down power
-;		While a range of [252, 756] will incr that rails bad read count
-;
 .equ	ALLOWED_BAD_READS,  5
 
 .section .bss
@@ -100,19 +86,19 @@ ERROR_STATE:
 sequencer_start:
     rjmp SETUP
 
-; select the multiplexer values in r24 using low 4 bits:
-;   r24 -> 0 | 0 | 0 | 0 | MUX3 | MUX2 | MUX1 | MUX0
+; select the multiplexer values in r17 using low 4 bits:
+;   r17 -> 0 | 0 | 0 | 0 | MUX3 | MUX2 | MUX1 | MUX0
 ; returns result in r19:r18
-; Clobbers r16, r24, SREG
+; Clobbers r16, r17, SREG
 GET_ADC:
     ; clear high 4 bits of r23
-    andi    r24,    0x0F
+    andi    r17,    0x0F
 
     ; Select AVCC from the REFS1 and REFS0 selection registers
     ;   REFS1 = 0,  REFS0 = 1
     ;   Low 4 bits of r24 occupy MUX3-MUX0
     ldi     r16,    (1 << REFS0)
-    or      r16,    r24
+    or      r16,    r17
     sts     ADMUX,  r16
 
     ; set ADEN 1, Prescaler selection to 128 (ADPS2 = ADPS1 = ADPS0 = 1)
@@ -147,16 +133,17 @@ ADC_WAIT:
 INIT_COUNTERS:	
     clr     r16
 
-    sts     NEG5V_BAD_COUNTER,	r16
-    sts     _12V_BAD_COUNTER,   r16
-    sts	    _5V_BAD_COUNTER,    r16
+    sts     NEG5V_BAD_COUNT,	r16
+    sts     _12V_BAD_COUNT,   r16
+    sts	    _5V_BAD_COUNT,    r16
     ret
 
 INIT_ERROR_STATE:
-    cls	    r16
+    clr	    r16
 
     sts     ERROR_STATE,   r16
-    ret`
+    ret
+
 INIT_ADC_PINS:
     ; set as inputs
     cbi     DDRC,   DETECT_5V_PIN
@@ -173,61 +160,68 @@ INIT_OUTPUT_PINS:
     ; set initial state low
     cbi     PORTD, ENABLE_5V_PIN
     cbi     PORTD, ENABLE_12V_PIN
+    cbi     PORTB, FAULT_LED_PIN
+    cbi     PORTB, GOOD_LED_PIN
 
     ; configure as output
     sbi     DDRD,  ENABLE_5V_PIN
     sbi     DDRD,  ENABLE_12V_PIN
+    cbi     DDRB,  FAULT_LED_PIN
+    cbi     DDRB,  GOOD_LED_PIN
+    ret
+
+
+FAULT_LED:
+    cbi     PORTB,  GOOD_LED_PIN
+    sbi     PORTB,  FAULT_LED_PIN
+    ret
+
+GOOD_LED:
+    cbi     PORTB,  FAULT_LED_PIN
+    cbi     PORTB,  GOOD_LED_PIN
     ret
 
 ;
-; r24 = rdc channel
-; r21:r20 = min adc val
-; r23:r22 = max adc val
+; r19:r18 = ADC readings
+; r21:r20 = absolute low threshold
+; r23:r22 = min acceptable threshold
+; r25:r24 = max acceptable threshold 
+; r27:r26 = absolute high threshold
+; r17 =   = adc channel
 ; returns r24:
 ;   2 = bad read, check if r28 has reached it's bound
 ;   1 = good
 ;   0 = Immediate shutdown
 ;Clobbers:
-;   r16, r18-r24
+;   r16, r17-r27
 CHECK_VOLTAGE:
-    ; r24 contains rdc channel
     rcall   GET_ADC
-
-    ; val < min?
+    
+    ; adc < abs_low 
     cp      r18,    r20
     cpc     r19,    r21
+    brlo    TRIGGER_SHUTDOWN
+
+    ; adc > abs_max
+    cp      r26,    r18
+    cpc     r27,    r19
+    brlo    TRIGGER_SHUTDOWN
+
+    ; adc < min?
+    cp      r18,    r22
+    cpc     r19,    r23
     brlo    VOLTAGE_BAD
 
-    ; val > max
-    cp      r22,    r18
-    cpc     r23,    r19
+    ; adc > max
+    cp      r24,    r18
+    cpc     r25,    r19
     brlo    VOLTAGE_BAD
 
     ldi     r24,    1
     ret
 
 VOLTAGE_BAD:
-    ; if voltage is bad, we need to decide whether it is a fault or if we incr the rails bad read counter
-
-    ; min adc / 2 = low bound to auto shutdown
-    lsr     r21
-    ror	    r20
-
-    ; min adc * 2 = high bound to auto shutdown
-    lsl     r23
-    rol     r22
-
-    ; val < min / 2?
-    cp      r18,	r20
-    cp      r19,        r21
-    brlo    TRIGGER_SHUTDOWN
-    
-    ; this max needs more consideration giving it can exceed 1023
-    ; val > min * 2?
-    cp      r22,	r18
-    cp	    r23,	r19
-    brlo    TRIGGER_SHUTDOWN
-    ldi     r24,	2	
+    ldi     r24,    2
     ret
 
 TRIGGER_SHUTDOWN:
@@ -237,13 +231,19 @@ TRIGGER_SHUTDOWN:
 ; Clobbers the following registers
 ; r16, r18, r19, r20, r21, r22, r23, r24
 CHECK_NEG5V:
-    ldi     r20,    lo8(MIN_NEG5V_ADC)
-    ldi     r21,    hi8(MIN_NEG5V_ADC) 
+    ldi     r20,    lo8(ABS_LOW_NEG5V)
+    ldi     r21,    hi8(ABS_LOW_NEG5V)
 
-    ldi     r22,    lo8(MAX_NEG5V_ADC)
-    ldi     r23,    hi8(MAX_NEG5V_ADC)
+    ldi     r22,    lo8(MIN_NEG5V_ADC)
+    ldi     r23,    hi8(MIN_NEG5V_ADC) 
 
-    ldi     r24,    DETECT_NEG5V_ADC
+    ldi     r24,    lo8(MAX_NEG5V_ADC)
+    ldi     r25,    hi8(MAX_NEG5V_ADC)
+
+    ldi     r26,    lo8(ABS_HIGH_NEG5V)
+    ldi     r27,    hi8(ABS_HIGH_NEG5V)
+
+    ldi     r17,    DETECT_NEG5V_ADC
 
     rcall   CHECK_VOLTAGE
 
@@ -252,6 +252,7 @@ CHECK_NEG5V:
 
     cpi     r24,    1
     breq    NEG5V_GOOD
+
 NEG5V_BAD:
     lds     r16,    NEG5V_BAD_COUNT
     inc     r16
@@ -270,13 +271,19 @@ NEG5V_GOOD:
 ; Clobbers the following registers
 ; r18, r19, r20, r21, r22, r23, r24
 CHECK_5V:
-    ldi     r20,    lo8(MIN_5V_ADC)
-    ldi     r21,    hi8(MIN_5V_ADC) 
+    ldi     r20,    lo8(ABS_LOW_5V)
+    ldi     r21,    hi8(ABS_LOW_5V)
 
-    ldi     r22,    lo8(MAX_5V_ADC)
-    ldi     r23,    hi8(MAX_5V_ADC)
+    ldi     r22,    lo8(MIN_5V_ADC)
+    ldi     r23,    hi8(MIN_5V_ADC) 
 
-    ldi     r24,    DETECT_5V_PIN
+    ldi     r24,    lo8(MAX_5V_ADC)
+    ldi     r25,    hi8(MAX_5V_ADC)
+
+    ldi     r26,    lo8(ABS_HIGH_5V)
+    ldi     r27,    hi8(ABS_HIGH_5V)
+
+    ldi     r17,    DETECT_5V_PIN
 
     rcall   CHECK_VOLTAGE
     
@@ -303,13 +310,19 @@ _5V_GOOD:
 ; Clobbers the following registers
 ; r18, r19, r20, r21, r22, r23, r24
 CHECK_12V:
-    ldi     r20,    lo8(MIN_12V_ADC)
-    ldi     r21,    hi8(MIN_12V_ADC) 
+    ldi     r20,    lo8(ABS_LOW_12V)
+    ldi     r21,    hi8(ABS_LOW_12V)
 
-    ldi     r22,    lo8(MAX_12V_ADC)
-    ldi     r23,    hi8(MAX_12V_ADC)
+    ldi     r22,    lo8(MIN_12V_ADC)
+    ldi     r23,    hi8(MIN_12V_ADC) 
 
-    ldi     r24,    DETECT_12V_PIN
+    ldi     r24,    lo8(MAX_12V_ADC)
+    ldi     r25,    hi8(MAX_12V_ADC)
+
+    ldi     r26,    lo8(ABS_HIGH_12V)
+    ldi     r27,    hi8(ABS_HIGH_12V)
+
+    ldi     r17,    DETECT_12V_PIN
 
     rcall   CHECK_VOLTAGE
 
@@ -317,19 +330,20 @@ CHECK_12V:
     breq    FAULT
 
     cpi     r24,     1
-    breq    _5V_GOOD
+    breq    _12V_GOOD
 _12V_BAD:
-    lds    r16,      _5V_BAD_COUNT
+    lds    r16,      _12V_BAD_COUNT
     inc    r16
-    sts    _5V_BAD_COUNT, r16
+    sts    _12V_BAD_COUNT, r16
 
     cpi    r16,     ALLOWED_BAD_READS
     brsh   FAULT
 
     ret
+
 _12V_GOOD:
     clr     r16
-    sts     _12_BAD_COUNT, r16
+    sts     _12V_BAD_COUNT, r16
 
     ret
 
@@ -353,6 +367,7 @@ SETUP:
     rcall   CHECK_NEG5V
     rcall   ENABLE_5V
     rcall   ENABLE_12V
+    rcall   GOOD_LED
     rjmp    RUN
 
 RUN:
@@ -374,7 +389,8 @@ FAULT:
 
     ; +5 V OFF second
     cbi   PORTD, 2
-
+    
+    rcall FAULT_LED
     rjmp  FAULT_LOOP
 
 FAULT_LOOP:
