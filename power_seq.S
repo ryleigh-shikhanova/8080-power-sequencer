@@ -56,6 +56,8 @@
 
 .equ	ALLOWED_BAD_READS,  5
 
+.equ    NUM_STARTUP_VOLTAGE_CHECKS,   5
+
 .section .bss
 
 NEG5V_BAD_COUNT:
@@ -292,6 +294,7 @@ CHECK_5V:
 
     cpi     r24,    1
     breq    _5V_GOOD
+
 _5V_BAD:
     lds     r16,    _5V_BAD_COUNT
     inc     r16
@@ -301,6 +304,7 @@ _5V_BAD:
     brsh    FAULT
 
     ret
+
 _5V_GOOD:
     clr     r16
     sts     _5V_BAD_COUNT, r16
@@ -349,24 +353,54 @@ _12V_GOOD:
 
 ENABLE_5V:
     sbi     PORTD, ENABLE_5V_PIN
+    ldi     r28,  NUM_STARTUP_VOLTAGE_CHECKS
+
+ENABLE_5V_LOOP:
     rcall   DELAY_20MS
     rcall   CHECK_5V
+
+    cpi     r24,  1 
+    brne    ENABLE_5V_FAULT
+
+    dec     r28
+    brne    ENABLE_5V_LOOP
+
+ENABLE_5V_SUCC:
     ret
+
+ENABLE_5V_FAULT:
+    rjmp    FAULT
 
 ENABLE_12V:
     sbi     PORTD, ENABLE_12V_PIN
+    ldi     r28,   NUM_STARTUP_VOLTAGE_CHECKS
+
+ENABLE_12V_LOOP:
     rcall   DELAY_20MS
     rcall   CHECK_12V
+
+    cpi     r24,  1 
+    brne    ENABLE_12V_FAULT 
+
+    dec     r28
+    brne    ENABLE_12V_LOOP
+
+ENABLE_12V_SUCC:
     ret
+
+ENABLE_12V_FAULT:
+    rjmp    FAULT 
 
 SETUP:
     rcall   INIT_COUNTERS
     rcall   INIT_ERROR_STATE
     rcall   INIT_ADC_PINS
     rcall   INIT_OUTPUT_PINS
+
     rcall   CHECK_NEG5V
     rcall   ENABLE_5V
     rcall   ENABLE_12V
+
     rcall   GOOD_LED
     rjmp    RUN
 
