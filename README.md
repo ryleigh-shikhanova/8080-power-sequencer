@@ -8,3 +8,4 @@ A dedicated power sequencing and monitoring system for an Intel 8080 hardware te
 The Intel 8080 requires three supply rails: -5 V, +5 V, and +12 V, with controlled startup and shutdown sequencing. This project uses an ATmega328P-based Arduino Nano as a standalone supervisor to monitor the rails, control relay-switched +5 V and +12 V supplies, and place the system into a safe state when a power fault is detected.
 
 The sequencer is being implemented primarily in AVR assembly, with small C++ wrappers where useful for Arduino functionality such as serial diagnostics.
+<img width="832" height="1802" alt="image" src="https://github.com/user-attachments/assets/f4f80218-87f8-41ab-acc8-2464a0871953" />
